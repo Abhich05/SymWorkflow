@@ -1,0 +1,25 @@
+# ── Python / Django ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+db.sqlite3
+backend/staticfiles/
+*.log
+
+# ── Node / React ──
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# ── Environment ──
+.env
+.env.local
+.env.*.local
+
+# ── OS / IDE ──
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
