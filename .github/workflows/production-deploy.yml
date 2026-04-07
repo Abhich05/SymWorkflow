@@ -1,0 +1,116 @@
+# ──────────────────────────────────────────────────────────────
+# SymplyChain — Production Deployment
+# Triggers on every push to the `main` branch.
+# Deploys React frontend to S3/CloudFront (production)
+# and Django backend to the production EC2 instance.
+# ──────────────────────────────────────────────────────────────
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  S3_BUCKET: symplychain-frontend-prod
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+  EC2_USER: ubuntu
+  PROJECT_DIR: /home/ubuntu/symplychain
+  VENV_PATH: /home/ubuntu/symplychain/venv
+
+jobs:
+  deploy:
+    name: Build & Deploy (Production)
+    runs-on: ubuntu-latest
+    # Extra safety: require the production environment (optional GitHub protection)
+    environment: production
+
+    steps:
+      # ── 1. Checkout source code ─────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Build React frontend ─────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build frontend for production
+        run: npm run build
+        working-directory: frontend
+
+      # ── 3. Configure AWS credentials ────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ── 4. Deploy frontend to S3 ────────────────────────────
+      - name: Sync frontend build to S3 (production)
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ env.S3_BUCKET }} \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "index.html"
+          # Upload index.html with no-cache so users always get the latest
+          aws s3 cp frontend/dist/index.html s3://${{ env.S3_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      # ── 5. Invalidate CloudFront cache ──────────────────────
+      - name: Invalidate CloudFront distribution (production)
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.PROD_CF_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      # ── 6. Deploy backend to EC2 via SSH ────────────────────
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+
+      - name: Deploy backend to production EC2
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ env.EC2_USER }}@${{ secrets.PROD_EC2_HOST }} << 'EOF'
+            set -e
+
+            echo "── Pulling latest main branch ──"
+            cd ${{ env.PROJECT_DIR }}
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+
+            echo "── Installing Python dependencies ──"
+            source ${{ env.VENV_PATH }}/bin/activate
+            pip install -r backend/requirements.txt --quiet
+
+            echo "── Running Django migrations ──"
+            cd backend
+            python manage.py migrate --noinput
+            python manage.py collectstatic --noinput
+
+            echo "── Restarting services ──"
+            sudo systemctl restart gunicorn
+            sudo systemctl restart celery
+            sudo systemctl restart celerybeat
+
+            echo "── Production deployment complete ──"
+          EOF
+
+      # ── 7. Cleanup ──────────────────────────────────────────
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
